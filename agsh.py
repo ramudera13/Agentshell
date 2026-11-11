@@ -926,6 +926,8 @@ class Runtime:
                                 hint="available: fetch post read write append filter pick map get let take search run ask checkpoint guard undo resume assert sort group count head tail uniq regex join llm summarize lines")
             try:
                 data = fn(data, subject, kw)
+                if verb not in ("fetch","write","post","run","append","undo","resume"):
+                    self.audit(verb, subject, "ok")  # all-stage audit (PR-2, DeryClaw)
             except AGSHError:
                 self.audit(verb, subject, "error")
                 raise
@@ -983,8 +985,13 @@ def build_plan(lines):
     return {"stages": stages, "summary": counts,
             "approval_required": needs, "verdict": verdict}
 
+VERSION = "0.3.1-deryclaw.1"
+
 def main():
     args = sys.argv[1:]
+    if "--version" in args or "-V" in args:
+        print(VERSION)
+        return
     plan_only = "--plan" in args
     allow_run = "--allow-run" in args
     approve = "--approve" in args
