@@ -150,6 +150,13 @@ class Runtime:
                 um, uu = payload.get("undo_method"), payload.get("undo_url")
                 if um and uu:
                     # REAL server-side undo (e.g. DELETE the created resource)
+                    # — same SSRF guard as post: undo must never become an
+                    # SSRF bypass via a crafted undo_url
+                    try:
+                        self._pin_host(uu, "undo")
+                    except AGSHError as e:
+                        undone.append(f"BLOCKED undo for {payload['method']} {payload['url']}: {e}")
+                        continue
                     try:
                         req = urllib.request.Request(uu, method=um,
                             headers={"Content-Type": "application/json"})
@@ -206,6 +213,15 @@ class Runtime:
         self.audit(verb, url, "ok", {"source": "network", "host": host})
         return "network"
 
+    def _pin_host(self, url, verb):
+        """Resolve + pin the host (must be called before any network write).
+        Blocks private/metadata networks by default and pins resolved IPs so
+        a later DNS-rebinding check can compare."""
+        source = self._ssrf_guard(url, verb)
+        if source == "network":
+            self._verify_dns_pin(url, verb)
+        return source
+
     def v_fetch(self, data, url, kw):
         if not re.match(r"https?://", url):
             raise AGSHError("fetch", "url must start with http(s)://", got=url)
@@ -215,9 +231,7 @@ class Runtime:
             raise AGSHError("fetch", f"rate limit exceeded: more than {self.max_fetch} fetch stages in one run",
                             hint="raise --max-fetch on the host if this is intentional, or split the task",
                             got=self.stats["fetches"])
-        source = self._ssrf_guard(url, "fetch")
-        if source == "network":
-            self._verify_dns_pin(url, "fetch")  # rebinding defense: re-resolve must match the pin
+        source = self._pin_host(url, "fetch")
         self.stats.setdefault("fetch_sources", []).append(f"{source}:{url.split('/')[2]}")
         # offline demo mode: serve from ./fixtures/<host>.json if present
         fixture = os.path.join("fixtures", url.split("/")[2] + ".json")
@@ -261,8 +275,13 @@ class Runtime:
 
     def _fetch_page(self, url, field, page):
         sep = "&" if "?" in url else "?"
+        # page requests bypass nothing: same SSRF/rebinding pin as the parent fetch
+        self._pin_host(url, "fetch")
         try:
-            with urllib.request.urlopen(f"{url}{sep}page={page}", timeout=15) as r:
+            req = urllib.request.Request(f"{url}{sep}page={page}", headers={
+                "Accept": "application/json",
+                "User-Agent": "AGSH/0.3 (agent; +https://github.com/Bumbu-indomie13/AGSH-)"})
+            with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read().decode()).get(field, [])
         except Exception:
             return None  # distinguishable from an empty page []
@@ -271,6 +290,9 @@ class Runtime:
         self.stats["verbs"] += 1
         if not isinstance(data, list):
             raise AGSHError("filter", "input must be a list", got=type(data).__name__)
+        if not (subject or "").strip() and not kw:
+            raise AGSHError("filter", "no filter expression",
+                            hint="use: filter FIELD=VALUE | filter FIELD>NUM | filter FIELD contains TEXT | filter FIELD ends-with TEXT", got=subject)
         # relational form: filter FIELD>NUM (also >= < <=) — numeric compare,
         # non-numeric/missing values simply don't match (consistent with =)
         m = re.fullmatch(r"([A-Za-z_]\w*)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)", (subject or "").strip())
@@ -287,15 +309,16 @@ class Runtime:
         if m:
             f, needle = m.group(1), m.group(2)
             return [x for x in data if isinstance(x, dict) and needle in str(x.get(f, ""))]
+        # suffix form: filter FIELD ends-with TEXT (generic — was hardcoded to email)
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s+ends-with\s+(\S+)", (subject or "").strip())
+        if m:
+            f, suffix = m.group(1), m.group(2)
+            return [x for x in data if isinstance(x, dict) and str(x.get(f, "")).endswith(suffix)]
         if kw:
             k, v = next(iter(kw.items()))
             return [x for x in data if isinstance(x, dict) and str(x.get(k)) == v]
-        if subject.startswith("email ends-with"):
-            suffix = subject.split()[-1]
-            return [x for x in data if str(x.get("email", "")).endswith(suffix)]
-        if kw.get("ends-with"):
-            return [x for x in data if str(x.get("email", "")).endswith(kw["ends-with"])]
-        raise AGSHError("filter", "unsupported filter form", got=subject)
+        raise AGSHError("filter", "unsupported filter form",
+                        hint="use: filter FIELD=VALUE | filter FIELD>NUM | filter FIELD contains TEXT | filter FIELD ends-with TEXT", got=subject)
 
     def v_pick(self, data, subject, kw):
         self.stats["verbs"] += 1
@@ -706,6 +729,11 @@ class Runtime:
             raise AGSHError("post", "network write requires approval",
                             hint="show the plan (--plan) to the user, then re-run with --approve",
                             got=subject)
+        # URL shape check first (cheap, no DNS), then payload validation, then
+        # the full SSRF/rebinding pin (DNS) last — a malformed/oversized
+        # payload must error BEFORE any DNS lookup or network call.
+        if not re.match(r"https?://", subject or ""):
+            raise AGSHError("post", "url must start with http(s)://", got=subject)
         undo_method = kw.get("undo_method")   # e.g. DELETE — real server call on undo
         undo_url = kw.get("undo_url")
         # schema validation (backlog #5): required keys + size cap BEFORE any
@@ -734,6 +762,13 @@ class Runtime:
                     raise AGSHError("post", f"payload missing required keys: {missing}",
                                     hint="add keys= in the post stage listing all required fields",
                                     got=sorted(it.keys()))
+        # SSRF + DNS-rebinding guard — network writes are the most dangerous
+        # surface an agent has; a prompt-injected agent must not be able to
+        # POST to internal services or cloud metadata endpoints. undo_url is
+        # a second network-write surface and gets the same pin.
+        self._pin_host(subject, "post")
+        if undo_url:
+            self._pin_host(undo_url, "post")
         # actually perform the POST
         body = body.encode()
         hdrs = {"Content-Type": "application/json", "Accept": "application/json",

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agsh"
+version = "0.3.0"
+description = "AGSH — Agent Shell: pipe-style DSL for token-efficient AI agent orchestration, executed outside the LLM"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Bumbu-indomie13" }]
+keywords = ["ai-agents", "dsl", "llm", "orchestration", "shell"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+dev = ["tiktoken"]
+
+[project.scripts]
+agsh = "agsh:main"
+
+[tool.setuptools]
+py-modules = ["agsh"]

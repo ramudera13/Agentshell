@@ -175,8 +175,8 @@ p = run_script(f'post http://127.0.0.1:{port}/things\n', d)
 o = parse_out(p)
 check("post blocked without --approve", o and "error" in o and "approval" in o["error"]["message"])
 
-# post with approval, then real DELETE undo
-p = sp.run(["python3", AGSH, "--approve"], input=f'post http://127.0.0.1:{port}/things undo_method=DELETE undo_url=http://127.0.0.1:{port}/things/42\n| undo\n', capture_output=True, text=True, cwd=d)
+# post with approval (localhost test server => --allow-private-net), then real DELETE undo
+p = sp.run(["python3", AGSH, "--approve", "--allow-private-net"], input=f'post http://127.0.0.1:{port}/things undo_method=DELETE undo_url=http://127.0.0.1:{port}/things/42\n| undo\n', capture_output=True, text=True, cwd=d)
 o = json.loads(p.stdout)
 methods = [m for m, _ in hits]
 check("post with --approve executes", any(m == "POST" for m in methods), f"hits={hits}")
