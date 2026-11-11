@@ -63,13 +63,20 @@ def parse_stage(toks):
 
 class Runtime:
     def __init__(self, dry=False, allow_run=False, approve_network_write=False, answer=None,
-                 allow_private_net=False, audit_path=None, max_fetch=20):
+                 allow_private_net=False, audit_path=None, max_fetch=20,
+                 allow_llm=False, llm_base=None, llm_key=None, llm_model=None,
+                 llm_max_input=8000):
         self.log = []          # undo log: [(kind, payload)]
         self.checkpoints = []  # indices into log
         self.allow_run = allow_run
         self.approve_network_write = approve_network_write
         self.answer = answer
         self.allow_private_net = allow_private_net
+        self.allow_llm = allow_llm
+        self.llm_base = llm_base
+        self.llm_key = llm_key
+        self.llm_model = llm_model
+        self.llm_max_input = llm_max_input
         self.vars = {}         # named state across the pipeline (let/take)
         self.audit_path = audit_path
         self._dns_pins = {}    # host -> frozenset of IPs seen at guard time (DNS-rebinding defense)
@@ -517,6 +524,143 @@ class Runtime:
                 except Exception: pass
         return out
 
+    # ---- LLM verb (bahasa): sub-pertanyaan dijawab DI DALAM pipeline ----
+    def _llm_chat(self, system, user, kw, verb):
+        """One OpenAI-compatible chat completion. Endpoint MUST be allowlisted
+        by the host (--llm-base); the key comes from the host env, never the script."""
+        import urllib.request
+        base = (self.llm_base or os.environ.get("AGSH_LLM_BASE") or "").rstrip("/")
+        key = self.llm_key or os.environ.get("AGSH_LLM_KEY") or ""
+        model = kw.get("model") or self.llm_model or os.environ.get("AGSH_LLM_MODEL") or "default"
+        if not base:
+            raise AGSHError(verb, "no LLM endpoint configured",
+                            hint="host must pass --llm-base http://host/v1 or set AGSH_LLM_BASE",
+                            got=None)
+        max_in = int(kw.get("max-input", self.llm_max_input))
+        body_data = json.dumps(user, ensure_ascii=False) if not isinstance(user, str) else user
+        if len(body_data.encode()) > max_in:
+            # never send oversized prompts silently — truncate visibly & count
+            body_data = body_data[:max_in]
+            self.stats["llm_truncated_chars"] = self.stats.get("llm_truncated_chars", 0) + 1
+        payload = {
+            "model": model,
+            "stream": False,  # 9router contract: without this the response is SSE even for non-chunk bodies
+            "messages": ([{"role": "system", "content": system}] if system else [])
+                        + [{"role": "user", "content": body_data}],
+            "max_tokens": int(kw.get("max-tokens", 300)),
+            "temperature": float(kw.get("temp", 0)),
+        }
+        req = urllib.request.Request(base + "/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=int(kw.get("timeout", 60))) as r:
+                resp = json.loads(r.read().decode())
+            msg = resp["choices"][0]["message"]
+            content = msg.get("content") or ""
+            finish = resp["choices"][0].get("finish_reason")
+            usage = resp.get("usage", {})
+            # reasoning models (deepseek-r1 style) may burn the whole token budget
+            # on reasoning_content before emitting any content — retry visibly
+            # with a larger budget instead of returning an empty answer
+            retries = 0
+            while not content.strip() and finish == "length" and retries < 2:
+                retries += 1
+                payload["max_tokens"] = int(payload["max_tokens"]) * 4
+                req = urllib.request.Request(base + "/chat/completions",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(req, timeout=int(kw.get("timeout", 60))) as r:
+                    resp = json.loads(r.read().decode())
+                msg = resp["choices"][0]["message"]
+                content = msg.get("content") or ""
+                finish = resp["choices"][0].get("finish_reason")
+                usage = resp.get("usage", {})
+            self.stats["llm_budget_retries"] = self.stats.get("llm_budget_retries", 0) + retries
+        except Exception as e:
+            raise AGSHError(verb, f"LLM call failed: {e}",
+                            hint="check the endpoint is up and the model name is valid", got=str(e)[:120])
+        if not content.strip():
+            raise AGSHError(verb, "LLM returned empty content (budget exhausted by reasoning)",
+                            hint="raise max-tokens= (e.g. 1000) or use a non-reasoning model via model=",
+                            got=f"finish_reason={finish}")
+        self.stats["llm_calls"] = self.stats.get("llm_calls", 0) + 1
+        self.stats["llm_prompt_tokens"] = self.stats.get("llm_prompt_tokens", 0) + usage.get("prompt_tokens", 0)
+        self.stats["llm_completion_tokens"] = self.stats.get("llm_completion_tokens", 0) + usage.get("completion_tokens", 0)
+        return content
+
+    def v_llm(self, data, subject, kw):
+        """llm "instruction" [model=NAME] [max-tokens=N] [max-input=N] [temp=F]
+        Sends the pipeline data (JSON) with an instruction; the model's answer
+        REPLACES the pipeline data. Deterministic: false is reported in stats."""
+        self.stats["verbs"] += 1
+        if not self.allow_llm:
+            raise AGSHError("llm", "LLM calls are gated",
+                            hint="host must re-run with --allow-llm (and --llm-base) if approved",
+                            got=subject)
+        if not subject:
+            raise AGSHError("llm", "missing instruction",
+                            hint='use: llm "kelompokkan error ini" max-tokens=200', got=None)
+        if data is None:
+            raise AGSHError("llm", "no input data — pipe something in (read/fetch first)",
+                            hint="example: read log.jsonl | llm \"ringkas error\"", got=None)
+        content = self._llm_chat(None, f"{subject}\n\nDATA:\n{data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)}", kw, "llm")
+        self.audit("llm", subject, "ok", {"model": kw.get("model") or self.llm_model or "default"})
+        # try to parse the answer as JSON (models often emit fenced blocks)
+        txt = content.strip()
+        if txt.startswith("```"):
+            txt = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", txt).rstrip("`").strip()
+        try:
+            return json.loads(txt)
+        except Exception:
+            return content
+
+    def v_summarize(self, data, subject, kw):
+        """summarize [max-chars=N] — DETERMINISTIC compression, no LLM:
+        reduces a long string/list into a compact head+tail window + stats,
+        so the pipeline (and the chat context) only carries the small version."""
+        self.stats["verbs"] += 1
+        max_chars = int(kw.get("max-chars", 1200))
+        if isinstance(data, list):
+            if len(data) <= 20:
+                return data
+            head, tail = data[:10], data[-5:]
+            out = {"summary": True, "total_items": len(data),
+                   "head": head, "tail": tail,
+                   "note": f"list compressed {len(data)} -> {len(head)+len(tail)} items (deterministic)"}
+            self.stats["summarize_savings"] = self.stats.get("summarize_savings", 0) + len(data) - len(head) - len(tail)
+            return out
+        text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+        if len(text) <= max_chars:
+            return data
+        cut = max_chars // 2
+        out = {"summary": True, "original_chars": len(text),
+               "head": text[:cut], "tail": text[-cut:],
+               "note": f"text compressed {len(text)} -> {max_chars} chars (deterministic head+tail)"}
+        self.stats["summarize_savings"] = self.stats.get("summarize_savings", 0) + len(text) - max_chars
+        self.audit("summarize", (subject or "")[:80], "ok", {"original_chars": len(text)})
+        return out
+
+    def v_lines(self, data, subject, kw):
+        """lines — split a text payload into a list of lines; each line is
+        parsed as JSON when possible (JSONL logs become filterable lists).
+        Pure/deterministic."""
+        self.stats["verbs"] += 1
+        if data is None:
+            raise AGSHError("lines", "no input — pipe a text payload in (read a file first)", got=None)
+        text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+        out = []
+        for ln in text.splitlines():
+            if not ln.strip():
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                out.append(ln)
+        return out
+
     def v_map(self, data, subject, kw):
         self.stats["verbs"] += 1
         if not isinstance(data, list):
@@ -744,7 +888,7 @@ class Runtime:
             fn = getattr(self, f"v_{verb}", None)
             if fn is None:
                 raise AGSHError(verb, f"unknown verb '{verb}'",
-                                hint="available: fetch post read write append filter pick map get let take search run ask checkpoint guard undo resume assert sort group count head tail uniq regex join")
+                                hint="available: fetch post read write append filter pick map get let take search run ask checkpoint guard undo resume assert sort group count head tail uniq regex join llm summarize lines")
             try:
                 data = fn(data, subject, kw)
             except AGSHError:
@@ -760,6 +904,9 @@ RISK = {
     "post": "network-write", "run": "exec", "checkpoint": "safe",
     "undo": "mutating", "ask": "human", "resume": "mutating",
     "let": "pure", "take": "pure", "get": "pure",
+    # LLM integration (Dery fork): llm = network call to an allowlisted endpoint,
+    # summarize = deterministic compression (pure)
+    "llm": "network-llm", "summarize": "pure", "lines": "pure",
     # PR2 composition verbs (by @DeryClawbot): pure unless reading a file
     "sort": "pure", "group": "pure", "count": "pure", "head": "pure",
     "tail": "pure", "uniq": "pure", "regex": "pure", "join": "local-read",
@@ -788,6 +935,7 @@ def build_plan(lines):
     needs = []
     if counts.get("exec"): needs.append("--allow-run")
     if counts.get("network-write"): needs.append("--approve")
+    if counts.get("network-llm"): needs.append("--allow-llm")
     if counts.get("sandbox-escape"):
         verdict = "BLOCKED: escapes sandbox (no flag can approve this)"
         needs = []
@@ -815,9 +963,23 @@ def main():
     answer = None
     if "--answer" in args:
         answer = args[args.index("--answer") + 1]
+    allow_llm = "--allow-llm" in args
+    llm_base = None
+    if "--llm-base" in args:
+        llm_base = args[args.index("--llm-base") + 1]
+    llm_key = None
+    if "--llm-key" in args:
+        llm_key = args[args.index("--llm-key") + 1]
+    llm_model = None
+    if "--llm-model" in args:
+        llm_model = args[args.index("--llm-model") + 1]
+    llm_max_input = 8000
+    if "--llm-max-input" in args:
+        llm_max_input = int(args[args.index("--llm-max-input") + 1])
     rt = Runtime(allow_run=allow_run, approve_network_write=approve, answer=answer,
                  allow_private_net=allow_private_net, audit_path=audit_path,
-                 max_fetch=max_fetch)
+                 max_fetch=max_fetch, allow_llm=allow_llm, llm_base=llm_base,
+                 llm_key=llm_key, llm_model=llm_model, llm_max_input=llm_max_input)
     data = None
     src = sys.stdin.read()
     lines = [l.strip() for l in src.splitlines() if l.strip() and not l.strip().startswith("#")]

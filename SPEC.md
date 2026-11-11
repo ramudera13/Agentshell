@@ -61,13 +61,15 @@ quoted     := '"' [^"]* '"' | "'" [^']* "'"
 
 ```
 agsh.py [--plan] [--allow-run] [--approve] [--answer TEXT] [--allow-private-net]
+        [--allow-llm] [--llm-base URL] [--llm-key KEY] [--llm-model NAME] [--llm-max-input N]
 ```
 
-- `--plan` — analyze without executing: per-stage risk classification (pure / local-read / local-write / network-read / network-write / exec / human / mutating) plus an aggregate verdict listing which approval flags are required.
+- `--plan` — analyze without executing: per-stage risk classification (pure / local-read / local-write / network-read / network-write / exec / human / mutating / network-llm) plus an aggregate verdict listing which approval flags are required.
 - `--allow-run` — unlock the `run` verb (restricted execution).
 - `--approve` — unlock `post` (network writes).
 - `--answer TEXT` — supply a human decision to resume past an `ask` gate.
 - `--allow-private-net` — unlock `fetch` to private/metadata networks (SSRF guard bypass; use only when intentional).
+- `--allow-llm` — unlock the `llm` verb. Endpoint ONLY from host flags/env (`--llm-base` atau `AGSH_LLM_BASE`), script tidak bisa mengaturnya sendiri. Key hanya via host (`--llm-key` / `AGSH_LLM_KEY`), tidak pernah lewat script.
 
 The intended loop: agent runs `--plan`, shows the risk summary to the user, gets a decision, then re-runs with the required flag.
 

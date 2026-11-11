@@ -36,7 +36,7 @@ printf '<pipeline AGSH>' | python3 /workspace/agsh/agsh.py [flags]
 3. Jika `needs approval` → tampilkan ke user, tunggu persetujuan, baru eksekusi dengan flag
 4. Jika sukses → baca `result` + `stats` (delta-feedback)
 
-## 3. Verb reference (16)
+## 3. Verb reference (16 + 3 Dery-fork)
 
 ```
 fetch URL [paginate=FIELD]     # HTTP GET JSON; auto-pagination; SSRF guard aktif
@@ -55,6 +55,15 @@ checkpoint [save=FILE]         # rollback point; save= = world-state lintas sesi
 undo [checkpoint=N]            # revert mutasi sejak checkpoint (file byte-per-byte, API = real HTTP)
 resume FILE                    # restore world-state di sesi baru
 ask QUESTION                   # human gate: exit 2 + {"needs_human": true}
+--- Dery fork (LLM integration) ---
+llm "INSTRUKSI" [model=M] [max-tokens=N] [max-input=N] [temp=F]
+                               # BUTUH --allow-llm + --llm-base; kirim pipeline data ke
+                               # LLM OpenAI-compatible, jawaban menggantikan pipeline data.
+                               # Auto-retry budget utk reasoning model; JSON answer auto-parse.
+summarize [max-chars=N]        # DETERMINISTIC (tanpa LLM): kompres teks head+tail atau
+                               # list 2000 -> 15 item. Pure, tanpa flag.
+lines                          # pecah teks/JSONL jadi list baris (JSON per-baris auto-parse).
+                               # Pure. Wajib sebelum filter utk file .jsonl/.log.
 ```
 
 **Parsing contract:** value yang mengandung `=`, `>`, `<`, `|` WAJIB di-quote: `filter x="a>b"`. Inline pipe boleh: `read f.json|pick n` = `read f.json | pick n`.
