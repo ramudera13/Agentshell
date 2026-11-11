@@ -52,7 +52,9 @@ def parse_stage(toks):
     verb, subject, kwargs = None, None, {}
     toks = [t for t in toks if t != "|"]  # continuation-pipe marker
     for i, t in enumerate(toks):
-        if "=" in t and i > 0 and not re.search(r"(>=|<=|==|>|<)", t):
+        if "==" in t and i > 1:
+            pass  # equality op inside subject — never kwargs (PR-2: shadowing reorder)
+        elif "=" in t and i > 0 and not re.search(r"(>=|<=|==|>|<)", t):
             k, v = t.split("=", 1)
             kwargs[k] = v
         elif i == 0:
@@ -317,8 +319,13 @@ class Runtime:
         if kw:
             k, v = next(iter(kw.items()))
             return [x for x in data if isinstance(x, dict) and str(x.get(k)) == v]
+        # equality form: filter FIELD == VALUE — string equality (PR-2, DeryClaw)
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*==\s*(.+)", (subject or "").strip())
+        if m:
+            f, val = m.group(1), m.group(2).strip().strip("\"'")
+            return [x for x in data if isinstance(x, dict) and str(x.get(f)) == val]
         raise AGSHError("filter", "unsupported filter form",
-                        hint="use: filter FIELD=VALUE | filter FIELD>NUM | filter FIELD contains TEXT | filter FIELD ends-with TEXT", got=subject)
+                        hint="use: filter FIELD=VALUE | filter FIELD>NUM | filter FIELD contains TEXT | filter FIELD ends-with TEXT | filter FIELD==VALUE", got=subject)
 
     def v_pick(self, data, subject, kw):
         self.stats["verbs"] += 1
