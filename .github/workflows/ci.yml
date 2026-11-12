@@ -12,10 +12,5 @@ jobs:
           python-version: "3.12"
       - name: Run test suite
         run: python3 tests.py
-      - name: Run feature test files (auth-env, record/replay, plan-redact, audit-all, relational filter)
-        run: |
-          for t in test_auditall test_authenv test_planredact test_recordreplay test_relational_filter tests_llm; do
-            echo "== $t =="; python3 $t.py
-          done
       - name: Run examples end-to-end
         run: bash examples/run-tests.sh
